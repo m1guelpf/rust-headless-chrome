@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use log::{debug, error, info, trace};
 
 use process::Process;
@@ -12,7 +12,7 @@ pub use process::{LaunchOptions, LaunchOptionsBuilder, DEFAULT_ARGS};
 pub use tab::Tab;
 pub use transport::ConnectionClosed;
 use transport::Transport;
-use websocket::url::Url;
+use url::Url;
 use which::which;
 
 use crate::protocol::cdp::{types::Event, types::Method, Browser as B, Target, CSS, DOM};
@@ -56,7 +56,7 @@ pub mod transport;
 /// #
 /// use headless_chrome::Browser;
 /// let browser = Browser::default()?;
-/// let first_tab = browser.wait_for_initial_tab()?;
+/// let first_tab = browser.new_tab()?;
 /// assert_eq!("about:blank", first_tab.get_url());
 /// #
 /// # Ok(())
@@ -105,10 +105,9 @@ impl Browser {
     /// binary can be found on the system.
     pub fn default() -> Result<Self> {
         let launch_options = LaunchOptions::default_builder()
-            .path(Some(default_executable().unwrap()))
-            .build()
-            .unwrap();
-        Ok(Self::new(launch_options).unwrap())
+            .path(Some(default_executable().map_err(|e| anyhow!(e))?))
+            .build()?;
+        Self::new(launch_options)
     }
 
     /// Allows you to drive an externally-launched Chrome process instead of launch one via [`Browser::new`].
@@ -163,11 +162,10 @@ impl Browser {
         trace!("Calling set discover");
         browser.call_method(SetDiscoverTargets { discover: true })?;
 
-        let tab = browser.wait_for_initial_tab()?;
+        let tab = browser.new_tab()?;
 
         tab.call_method(DOM::Enable(None))?;
         tab.call_method(CSS::Enable(None))?;
-
         Ok(browser)
     }
 
@@ -181,15 +179,21 @@ impl Browser {
         &self.inner.tabs
     }
 
+    // THIS NO LONGER SEEMS TRUE |
+    //                           v
     /// Chrome always launches with at least one tab. The reason we have to 'wait' is because information
     /// about that tab isn't available *immediately* after starting the process. Tabs are behind `Arc`s
     /// because they each have their own thread which handles events and method responses directed to them.
     ///
     /// Wait timeout: 10 secs
+    #[deprecated(since = "1.0.4", note = "Use new_tab() instead.")]
     pub fn wait_for_initial_tab(&self) -> Result<Arc<Tab>> {
-        util::Wait::with_timeout(Duration::from_secs(10))
+        match util::Wait::with_timeout(Duration::from_secs(10))
             .until(|| self.inner.tabs.lock().unwrap().first().map(Arc::clone))
-            .map_err(Into::into)
+        {
+            Ok(tab) => Ok(tab),
+            Err(_) => self.new_tab(),
+        }
     }
 
     /// Create a new tab and return a handle to it.
@@ -202,7 +206,7 @@ impl Browser {
     /// #
     /// # use headless_chrome::Browser;
     /// # let browser = Browser::default()?;
-    /// let first_tab = browser.wait_for_initial_tab()?;
+    /// let first_tab = browser.new_tab()?;
     /// let new_tab = browser.new_tab()?;
     /// let num_tabs = browser.get_tabs().lock().unwrap().len();
     /// assert_eq!(2, num_tabs);
@@ -371,9 +375,11 @@ impl Browser {
                                 }
                             }
                             _ => {
-                                let mut raw_event = format!("{:?}", event);
-                                raw_event.truncate(50);
-                                trace!("Unhandled event: {}", raw_event);
+                                let raw_event = format!("{event:?}");
+                                trace!(
+                                    "Unhandled event: {}",
+                                    raw_event.chars().take(50).collect::<String>()
+                                );
                             }
                         }
                     }

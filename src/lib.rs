@@ -22,7 +22,7 @@
 //! fn browse_wikipedia() -> Result<(), failure::Error> {
 //!     let browser = Browser::default()?;
 //!
-//!     let tab = browser.wait_for_initial_tab()?;
+//!     let tab = browser.new_tab()?;
 //!
 //!     /// Navigate to wikipedia
 //!     tab.navigate_to("https://www.wikipedia.org")?;
@@ -77,6 +77,9 @@ clippy::cast_sign_loss, // for tab/element/mod.rs:492 & 493
 clippy::cast_lossless, // for tab/element/mod.rs:492 & 493
 clippy::vtable_address_comparisons, // for tab/mod.rs:1415
 clippy::derivable_impls, // for types.rs Default for PrintToPDF because autogen
+clippy::type_complexity, // for transport/web_socket_connection.rs:133
+clippy::manual_let_else, // for transport/web_socket_connection.rs:142
+clippy::should_implement_trait, // for browser/mod.rs:106
 )]
 
 #[macro_use]

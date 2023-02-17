@@ -51,7 +51,7 @@ fn browser() -> Browser {
 
 fn dumb_client(server: &server::Server) -> (Browser, Arc<Tab>) {
     let browser = browser();
-    let tab = browser.wait_for_initial_tab().unwrap();
+    let tab = browser.new_tab().unwrap();
     tab.navigate_to(&format!("http://127.0.0.1:{}", server.port()))
         .unwrap();
     (browser, tab)
@@ -71,7 +71,7 @@ fn simple() -> Result<()> {
 fn bounds_changed() -> Result<(), anyhow::Error> {
     logging::enable_logging();
     let browser = browser();
-    let tab = browser.wait_for_initial_tab().unwrap();
+    let tab = browser.new_tab().unwrap();
 
     // New browser windows start in normal (windowed) state
     let bounds = tab.get_bounds()?;
@@ -110,7 +110,7 @@ fn bounds_changed() -> Result<(), anyhow::Error> {
 fn bounds_unchanged() -> Result<(), anyhow::Error> {
     logging::enable_logging();
     let browser = browser();
-    let tab = browser.wait_for_initial_tab().unwrap();
+    let tab = browser.new_tab().unwrap();
     let bounds = tab.get_bounds()?;
 
     // Minimizing a window does *not* change it's bounds
@@ -220,8 +220,6 @@ fn decode_png(i: &[u8]) -> Result<Vec<u8>> {
     let decoder = png::Decoder::new(i);
     let mut reader = decoder.read_info()?;
     let mut buf = vec![0; reader.output_buffer_size()];
-    let info = reader.next_frame(&mut buf).unwrap();
-    let mut buf = vec![0; info.buffer_size()];
     reader.next_frame(&mut buf)?;
     Ok(buf)
 }
@@ -401,7 +399,7 @@ fn reload() -> Result<()> {
         let response = tiny_http::Response::new(
             200.into(),
             vec![tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"text/html"[..]).unwrap()],
-            std::io::Cursor::new(format!(r#"<div id="counter">{}</div>"#, counter)),
+            std::io::Cursor::new(format!(r#"<div id="counter">{counter}</div>"#)),
             None,
             None,
         );
@@ -643,7 +641,7 @@ fn set_request_interception() -> Result<()> {
 fn authentication() -> Result<()> {
     logging::enable_logging();
     let browser = Browser::default()?;
-    let tab = browser.wait_for_initial_tab()?;
+    let tab = browser.new_tab()?;
     tab.authenticate(Some("login".to_string()), Some("password".to_string()))?;
     tab.enable_fetch(None, Some(true))?;
     tab.navigate_to("http://httpbin.org/basic-auth/login/password")?;
@@ -661,7 +659,7 @@ fn response_handler() -> Result<()> {
 
     let browser = Browser::default()?;
 
-    let tab = browser.wait_for_initial_tab().unwrap();
+    let tab = browser.new_tab().unwrap();
 
     let responses = Arc::new(Mutex::new(Vec::new()));
 
@@ -709,6 +707,48 @@ fn response_handler() -> Result<()> {
 }
 
 #[test]
+fn loading_failed_handler() -> Result<()> {
+    logging::enable_logging();
+    let server = server::Server::with_dumb_html(include_str!(
+        "coverage_fixtures/basic_page_with_loading_failed_element.html"
+    ));
+    let browser = Browser::default()?;
+
+    let tab = browser.new_tab().unwrap();
+
+    let failed_event = Arc::new(Mutex::new(Vec::new()));
+
+    let failed_event_clone = failed_event.clone();
+    assert!(tab
+        .register_loading_failed_handling(
+            "test1",
+            Box::new(move |response, loading_failed| {
+                failed_event_clone
+                    .lock()
+                    .unwrap()
+                    .push((response, loading_failed))
+            })
+        )?
+        .is_none());
+
+    tab.navigate_to(&format!("http://127.0.0.1:{}", server.port()))
+        .unwrap();
+
+    tab.wait_until_navigated()?;
+
+    let final_failed_event: Vec<_> = failed_event.lock().unwrap().clone();
+    assert_eq!(final_failed_event.len(), 1);
+    assert_eq!(
+        final_failed_event[0].0.response.url,
+        "http://httpbin.org/status/404"
+    );
+    assert_eq!(final_failed_event[0].0.response.status, 404);
+    assert_eq!(final_failed_event[0].1.error_text, "net::ERR_ABORTED");
+
+    Ok(())
+}
+
+#[test]
 fn incognito_contexts() -> Result<()> {
     logging::enable_logging();
     let (server, browser, tab) = dumb_server(include_str!("simple.html"));
@@ -731,7 +771,7 @@ fn get_script_source() -> Result<()> {
     let server = server::file_server("tests/coverage_fixtures");
     let browser = Browser::default()?;
 
-    let tab: Arc<Tab> = browser.wait_for_initial_tab()?;
+    let tab: Arc<Tab> = browser.new_tab()?;
 
     tab.enable_profiler()?;
     tab.start_js_coverage()?;

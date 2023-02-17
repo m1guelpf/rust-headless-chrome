@@ -26,6 +26,8 @@ use crate::protocol::cdp::{
 
 use Runtime::AddBinding;
 
+use base64::Engine;
+
 use Input::DispatchKeyEvent;
 
 use Page::{AddScriptToEvaluateOnNewDocument, Navigate, SetInterceptFileChooserDialog};
@@ -44,8 +46,8 @@ use Fetch::{
 };
 
 use Network::{
-    events::ResponseReceivedEventParams, Cookie, GetResponseBody, GetResponseBodyReturnObject,
-    SetExtraHTTPHeaders, SetUserAgentOverride,
+    events::LoadingFailedEventParams, events::ResponseReceivedEventParams, Cookie, GetResponseBody,
+    GetResponseBodyReturnObject, SetExtraHTTPHeaders, SetUserAgentOverride,
 };
 
 use crate::util;
@@ -75,6 +77,15 @@ pub type ResponseHandler = Box<
             GetResponseBodyReturnObject,
             Error,
         >,
+    ) + Send
+    + Sync,
+>;
+
+#[rustfmt::skip]
+pub type LoadingFailedHandler = Box<
+    dyn Fn(
+        ResponseReceivedEventParams,
+        LoadingFailedEventParams
     ) + Send
     + Sync,
 >;
@@ -141,6 +152,7 @@ pub struct Tab {
     target_info: Arc<Mutex<TargetInfo>>,
     request_interceptor: Arc<Mutex<Arc<RequestIntercept>>>,
     response_handler: Arc<Mutex<HashMap<String, ResponseHandler>>>,
+    loading_failed_handler: Arc<Mutex<HashMap<String, LoadingFailedHandler>>>,
     auth_handler: Arc<Mutex<AuthChallengeResponse>>,
     default_timeout: Arc<RwLock<Duration>>,
     page_bindings: Arc<Mutex<FunctionBinding>>,
@@ -161,6 +173,10 @@ pub struct NavigationFailed {
 #[derive(Debug, Error)]
 #[error("No LocalStorage item was found")]
 pub struct NoLocalStorageItemFound {}
+
+#[derive(Debug, Error)]
+#[error("No UserAgent evaluated")]
+pub struct NoUserAgentEvaluated {}
 
 impl NoElementFound {
     pub fn map(error: Error) -> Error {
@@ -208,6 +224,7 @@ impl Tab {
                 |_transport, _session_id, _interception| RequestPausedDecision::Continue(None),
             ))),
             response_handler: Arc::new(Mutex::new(HashMap::new())),
+            loading_failed_handler: Arc::new(Mutex::new(HashMap::new())),
             auth_handler: Arc::new(Mutex::new(AuthChallengeResponse {
                 response: Fetch::AuthChallengeResponseResponse::Default,
                 username: None,
@@ -277,6 +294,7 @@ impl Tab {
         let navigating = Arc::clone(&self.navigating);
         let interceptor_mutex = Arc::clone(&self.request_interceptor);
         let response_handler_mutex = self.response_handler.clone();
+        let loading_failed_handler_mutex = self.loading_failed_handler.clone();
         let auth_handler_mutex = self.auth_handler.clone();
         let session_id = self.session_id.clone();
         let listeners_mutex = Arc::clone(&self.event_listeners);
@@ -395,10 +413,27 @@ impl Tab {
                             },
                         );
                     }
+                    Event::NetworkLoadingFailed(ev) => loading_failed_handler_mutex
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .for_each(|(_name, handler)| {
+                            let request_id = ev.params.request_id.clone();
+
+                            if let Some(params) =
+                                received_event_params.lock().unwrap().get(&request_id)
+                            {
+                                handler(params.clone(), ev.params.clone());
+                            } else {
+                                warn!("Request id does not exist");
+                            }
+                        }),
                     _ => {
-                        let mut raw_event = format!("{:?}", event);
-                        raw_event.truncate(50);
-                        trace!("Unhandled event: {}", raw_event);
+                        let raw_event = format!("{event:?}");
+                        trace!(
+                            "Unhandled event: {}",
+                            raw_event.chars().take(50).collect::<String>()
+                        );
                     }
                 }
             }
@@ -465,9 +500,8 @@ impl Tab {
         let result = self
             .transport
             .call_method_on_target(self.session_id.clone(), method);
-        let mut result_string = format!("{:?}", result);
-        result_string.truncate(70);
-        trace!("Got result: {:?}", result_string);
+        let result_string = format!("{result:?}");
+        trace!("Got result: {:?}", result_string.chars().take(70));
         result
     }
 
@@ -521,7 +555,7 @@ impl Tab {
     /// # fn main() -> Result<()> {
     /// # use headless_chrome::Browser;
     /// # let browser = Browser::default()?;
-    /// let tab = browser.wait_for_initial_tab()?;
+    /// let tab = browser.new_tab()?;
     /// tab.set_default_timeout(std::time::Duration::from_secs(5));
     /// #
     /// # Ok(())
@@ -634,7 +668,7 @@ impl Tab {
     /// use headless_chrome::Browser;
     ///
     /// let browser = Browser::default()?;
-    /// let initial_tab = browser.wait_for_initial_tab()?;
+    /// let initial_tab = browser.new_tab()?;
     ///
     /// let file_server = server::Server::with_dumb_html(include_str!("../../../tests/simple.html"));
     /// let element = initial_tab.navigate_to(&file_server.url())?
@@ -644,7 +678,7 @@ impl Tab {
     /// assert_eq!(attrs["id"], "foobar");
     /// #
     /// # Ok(())
-    /// # }
+    /// # }z
     /// ```
     pub fn find_element(&self, selector: &str) -> Result<Element<'_>> {
         let root_node_id = self.get_document()?.node_id;
@@ -760,6 +794,8 @@ impl Tab {
     }
 
     pub fn find_elements_by_xpath(&self, query: &str) -> Result<Vec<Element<'_>>> {
+        self.get_document()?;
+
         self.call_method(DOM::PerformSearch {
             query: query.to_string(),
             include_user_agent_shadow_dom: None,
@@ -989,7 +1025,7 @@ impl Tab {
     /// #
     /// use headless_chrome::{protocol::page::ScreenshotFormat, Browser, LaunchOptions};
     /// let browser = Browser::new(LaunchOptions::default_builder().build().unwrap())?;
-    /// let tab = browser.wait_for_initial_tab()?;
+    /// let tab = browser.new_tab()?;
     /// let viewport = tab.navigate_to("https://en.wikipedia.org/wiki/WebKit")?
     ///     .wait_for_element("#mw-content-text > div > table.infobox.vevent")?
     ///     .get_box_model()?
@@ -1015,7 +1051,9 @@ impl Tab {
                 capture_beyond_viewport: None,
             })?
             .data;
-        base64::decode(&data).map_err(Into::into)
+        base64::prelude::BASE64_STANDARD
+            .decode(data)
+            .map_err(Into::into)
     }
 
     pub fn print_to_pdf(&self, options: Option<PrintToPdfOptions>) -> Result<Vec<u8>> {
@@ -1042,7 +1080,9 @@ impl Tab {
                     transfer_mode,
                 })?
                 .data;
-            base64::decode(&data).map_err(Into::into)
+            base64::prelude::BASE64_STANDARD
+                .decode(data)
+                .map_err(Into::into)
         } else {
             let data = self
                 .call_method(Page::PrintToPDF {
@@ -1050,7 +1090,9 @@ impl Tab {
                 })?
                 .data;
 
-            base64::decode(&data).map_err(Into::into)
+            base64::prelude::BASE64_STANDARD
+                .decode(data)
+                .map_err(Into::into)
         }
     }
 
@@ -1083,7 +1125,7 @@ impl Tab {
     /// #
     /// use headless_chrome::{protocol::page::ScreenshotFormat, Browser, LaunchOptions};
     /// let browser = Browser::new(LaunchOptions::default_builder().build().unwrap())?;
-    /// let tab = browser.wait_for_initial_tab()?;
+    /// let tab = browser.new_tab()?;
     /// tab.set_transparent_background_color()?;
     ///
     /// #
@@ -1112,7 +1154,7 @@ impl Tab {
     /// #
     /// use headless_chrome::{protocol::page::ScreenshotFormat, Browser, LaunchOptions};
     /// let browser = Browser::new(LaunchOptions::default_builder().build().unwrap())?;
-    /// let tab = browser.wait_for_initial_tab()?;
+    /// let tab = browser.new_tab()?;
     /// tab.set_background_color( color: RGBA { r: 255, g: 0, b: 0, a: 1.,})?;
     ///
     /// #
@@ -1257,6 +1299,23 @@ impl Tab {
             .insert(handler_name.to_string(), handler))
     }
 
+    pub fn register_loading_failed_handling<S: ToString>(
+        &self,
+        handler_name: S,
+        handler: LoadingFailedHandler,
+    ) -> Result<Option<LoadingFailedHandler>> {
+        self.call_method(Network::Enable {
+            max_total_buffer_size: None,
+            max_resource_buffer_size: None,
+            max_post_data_size: None,
+        })?;
+        Ok(self
+            .loading_failed_handler
+            .lock()
+            .unwrap()
+            .insert(handler_name.to_string(), handler))
+    }
+
     /// Deregister a reponse handler based on its name.
     ///
     /// Return a option for ResponseHandler for removed handler if existed.
@@ -1386,7 +1445,7 @@ impl Tab {
     /// # use headless_chrome::Browser;
     /// # use headless_chrome::protocol::Event;
     /// # let browser = Browser::default()?;
-    /// # let tab = browser.wait_for_initial_tab()?;
+    /// # let tab = browser.new_tab()?;
     /// tab.enable_log()?;
     /// tab.add_event_listener(Arc::new(move |event: &Event| {
     ///     match event {
@@ -1569,7 +1628,7 @@ impl Tab {
     /// # fn main() -> Result<()> {
     /// #
     /// # let browser = Browser::default()?;
-    /// # let tab = browser.wait_for_initial_tab()?;
+    /// # let tab = browser.new_tab()?;
     /// tab.navigate_to("https://google.com")?;
     /// tab.wait_until_navigated()?;
     /// let title = tab.get_title()?;
@@ -1627,10 +1686,7 @@ impl Tab {
         let value = json!(item).to_string();
 
         self.evaluate(
-            &format!(
-                r#"localStorage.setItem("{}",JSON.stringify({}))"#,
-                item_name, value
-            ),
+            &format!(r#"localStorage.setItem("{item_name}",JSON.stringify({value}))"#),
             false,
         )?;
 
@@ -1641,7 +1697,7 @@ impl Tab {
     where
         T: DeserializeOwned,
     {
-        let object = self.evaluate(&format!(r#"localStorage.getItem("{}")"#, item_name), false)?;
+        let object = self.evaluate(&format!(r#"localStorage.getItem("{item_name}")"#), false)?;
 
         let json: Option<T> = object.value.and_then(|v| match v {
             serde_json::Value::String(ref s) => {
@@ -1663,15 +1719,110 @@ impl Tab {
     }
 
     pub fn remove_storage(&self, item_name: &str) -> Result<()> {
-        self.evaluate(
-            &format!(r#"localStorage.removeItem("{}")"#, item_name),
-            false,
-        )?;
+        self.evaluate(&format!(r#"localStorage.removeItem("{item_name}")"#), false)?;
 
         Ok(())
     }
 
     pub fn stop_loading(&self) -> Result<bool> {
         self.call_method(Page::StopLoading(None)).map(|_| true)
+    }
+
+    fn bypass_user_agent(&self) -> Result<()> {
+        let object = self.evaluate("window.navigator.userAgent", true)?;
+
+        match object.value.map(|x| x.to_string()) {
+            Some(mut ua) => {
+                ua = ua.replace("HeadlessChrome/", "Chrome/");
+
+                let re = regex::Regex::new(r"\(([^)]+)\)")?;
+                ua = re.replace(&ua, "(Windows NT 10.0; Win64; x64)").to_string();
+
+                self.set_user_agent(&ua, None, None)?;
+                Ok(())
+            }
+            None => Err(NoUserAgentEvaluated {}.into()),
+        }
+    }
+
+    fn bypass_wedriver(&self) -> Result<()> {
+        self.call_method(Page::AddScriptToEvaluateOnNewDocument {
+            source: "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+                .to_string(),
+            world_name: None,
+            include_command_line_api: None,
+        })?;
+        Ok(())
+    }
+
+    fn bypass_chrome(&self) -> Result<()> {
+        self.call_method(Page::AddScriptToEvaluateOnNewDocument {
+            source: "window.chrome = { runtime: {} };".to_string(),
+            world_name: None,
+            include_command_line_api: None,
+        })?;
+        Ok(())
+    }
+
+    fn bypass_permissions(&self) -> Result<()> {
+        let r = "const originalQuery = window.navigator.permissions.query;
+        window.navigator.permissions.__proto__.query = parameters =>
+        parameters.name === 'notifications'
+            ? Promise.resolve({state: Notification.permission})
+            : originalQuery(parameters);";
+
+        self.call_method(Page::AddScriptToEvaluateOnNewDocument {
+            source: r.to_string(),
+            world_name: None,
+            include_command_line_api: None,
+        })?;
+        Ok(())
+    }
+
+    fn bypass_plugins(&self) -> Result<()> {
+        self.call_method(Page::AddScriptToEvaluateOnNewDocument {
+            source: "Object.defineProperty(navigator, 'plugins', { get: () => [
+            {filename:'internal-pdf-viewer'},
+            {filename:'adsfkjlkjhalkh'},
+            {filename:'internal-nacl-plugin'}
+          ], });"
+                .to_string(),
+            world_name: None,
+            include_command_line_api: None,
+        })?;
+        Ok(())
+    }
+
+    fn bypass_webgl_vendor(&self) -> Result<()> {
+        let r = "const getParameter = WebGLRenderingContext.getParameter;
+        WebGLRenderingContext.prototype.getParameter = function(parameter) {
+            // UNMASKED_VENDOR_WEBGL
+            if (parameter === 37445) {
+                return 'Google Inc. (NVIDIA)';
+            }
+            // UNMASKED_RENDERER_WEBGL
+            if (parameter === 37446) {
+                return 'ANGLE (NVIDIA, NVIDIA GeForce GTX 1050 Direct3D11 vs_5_0 ps_5_0, D3D11-27.21.14.5671)';
+            }
+
+            return getParameter(parameter);
+        };";
+
+        self.call_method(Page::AddScriptToEvaluateOnNewDocument {
+            source: r.to_string(),
+            world_name: None,
+            include_command_line_api: None,
+        })?;
+        Ok(())
+    }
+
+    pub fn enable_stealth_mode(&self) -> Result<()> {
+        self.bypass_user_agent()?;
+        self.bypass_wedriver()?;
+        self.bypass_chrome()?;
+        self.bypass_permissions()?;
+        self.bypass_plugins()?;
+        self.bypass_webgl_vendor()?;
+        Ok(())
     }
 }

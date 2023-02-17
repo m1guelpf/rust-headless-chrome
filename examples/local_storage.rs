@@ -9,7 +9,7 @@ fn main() -> Result<()> {
             .expect("Could not find chrome-executable"),
     )?;
 
-    let tab = browser.wait_for_initial_tab()?;
+    let tab = browser.new_tab()?;
 
     tab.navigate_to("https://www.wikipedia.com")
         .expect("failed to navigate");
@@ -18,7 +18,7 @@ fn main() -> Result<()> {
 
     let item: String = tab.get_storage("translationHash")?;
 
-    println!("{}", item);
+    println!("{item}");
 
     Ok(())
 }

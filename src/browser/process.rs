@@ -16,7 +16,7 @@ use rand::seq::SliceRandom;
 use rand::thread_rng;
 use regex::Regex;
 use thiserror::Error;
-use websocket::url::Url;
+use url::Url;
 #[cfg(windows)]
 use winreg::{enums::HKEY_LOCAL_MACHINE, RegKey};
 
@@ -274,10 +274,10 @@ impl Process {
         } else {
             get_available_port().ok_or(ChromeLaunchError::NoAvailablePorts {})?
         };
-        let port_option = format!("--remote-debugging-port={}", debug_port);
+        let port_option = format!("--remote-debugging-port={debug_port}");
 
         let window_size_option = if let Some((width, height)) = launch_options.window_size {
-            format!("--window-size={},{}", width, height)
+            format!("--window-size={width},{height}")
         } else {
             String::new()
         };
@@ -344,7 +344,7 @@ impl Process {
         }
 
         let proxy_server_option = if let Some(proxy_server) = launch_options.proxy_server {
-            format!("--proxy-server={}", proxy_server)
+            format!("--proxy-server={proxy_server}")
         } else {
             String::new()
         };
@@ -388,9 +388,9 @@ impl Process {
     where
         R: Read,
     {
-        let port_taken_re = Regex::new(r"ERROR.*bind\(\)").unwrap();
+        let port_taken_re = Regex::new(r"ERROR.*bind\(\)")?;
 
-        let re = Regex::new(r"listening on (.*/devtools/browser/.*)$").unwrap();
+        let re = Regex::new(r"listening on (.*/devtools/browser/.*)$")?;
 
         let extract = |text: &str| -> Option<String> {
             let caps = re.captures(text);
@@ -416,7 +416,7 @@ impl Process {
 
     fn ws_url_from_output(child_process: &mut Child) -> Result<Url> {
         let chrome_output_result = util::Wait::with_timeout(Duration::from_secs(30)).until(|| {
-            let my_stderr = BufReader::new(child_process.stderr.as_mut().unwrap());
+            let my_stderr = BufReader::new(child_process.stderr.as_mut()?);
             match Self::ws_url_from_reader(my_stderr) {
                 Ok(output_option) => output_option.map(Ok),
                 Err(err) => Some(Err(err)),
@@ -543,11 +543,8 @@ mod tests {
         use std::fs::File;
         use std::io::prelude::*;
         let current_pid = std::process::id();
-        let mut current_process_children_file = File::open(format!(
-            "/proc/{}/task/{}/children",
-            current_pid, current_pid
-        ))
-        .unwrap();
+        let mut current_process_children_file =
+            File::open(format!("/proc/{current_pid}/task/{current_pid}/children")).unwrap();
         let mut child_pids = String::new();
         current_process_children_file
             .read_to_string(&mut child_pids)
